@@ -156,6 +156,26 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS line_elo_snapshots (
+                snapshot_utc TEXT NOT NULL,
+                line_id TEXT NOT NULL,
+                line_name TEXT NOT NULL,
+                elo INTEGER NOT NULL,
+                on_time_arrivals INTEGER NOT NULL,
+                late_arrivals INTEGER NOT NULL,
+                cancelled_trains INTEGER NOT NULL,
+                PRIMARY KEY (snapshot_utc, line_id)
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_elo_snapshots_line_time
+            ON line_elo_snapshots(line_id, snapshot_utc)
+            """
+        )
         con.commit()
     finally:
         con.close()
@@ -460,14 +480,33 @@ def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) 
     late_avg_minutes = float(row["late_minutes_total"]) / max(1.0, float(row["late_events"]))
     late_severity = min(1.0, late_avg_minutes / 15.0)
 
-    performance = on_time_ratio - (0.55 * late_ratio * (1.0 + late_severity)) - (1.35 * cancel_ratio)
-    qty_bonus = 0.03 * math.log1p(resolved_w)
-    raw_delta = 420.0 * ((performance - 0.45) + qty_bonus)
+    peak_w = float(row["weighted_peak_events"])
+    peak_fail_w = float(row["weighted_peak_failures"])
+    peak_fail_ratio = peak_fail_w / max(1.0, peak_w)
 
-    confidence = min(1.0, math.sqrt(resolved_w) / 25.0)
+    late_penalty = 1.60 * late_ratio * (1.0 + late_severity)
+    cancel_ratio_penalty = 4.2 * cancel_ratio
+    peak_penalty = 1.9 * peak_fail_ratio
+    cancel_shock = 0.45 * (1.0 - math.exp(-float(row["missed_events"]) / 5.0))
+    late_shock = 0.24 * (1.0 - math.exp(-float(row["late_events"]) / 14.0))
+
+    performance = on_time_ratio - late_penalty - cancel_ratio_penalty - peak_penalty - cancel_shock - late_shock
+    qty_bonus = 0.010 * math.log1p(resolved_w)
+    raw_delta = 2100.0 * ((performance - 0.40) + qty_bonus)
+
+    confidence = min(1.0, math.sqrt(resolved_w) / 18.0)
     raw_delta *= confidence
 
     return base_elo + apply_boundary_friction(base_elo, raw_delta)
+
+
+def adaptive_base_elo(seed_elo: float, row: Dict[str, float | int | str]) -> float:
+    resolved_w = float(row["weighted_arrivals"]) + float(row["weighted_lates"]) + float(row["weighted_cancellations"])
+    if resolved_w <= 0.0:
+        return seed_elo
+
+    seed_weight = min(0.35, 40.0 / (40.0 + resolved_w))
+    return (BASE_ELO * (1.0 - seed_weight)) + (seed_elo * seed_weight)
 
 
 def load_seed_map(db_path: str) -> Dict[str, Dict[str, float | str]]:
@@ -736,6 +775,8 @@ def export_line_event_elo(
             "weighted_arrivals": 0.0,
             "weighted_lates": 0.0,
             "weighted_cancellations": 0.0,
+            "weighted_peak_events": 0.0,
+            "weighted_peak_failures": 0.0,
         }
 
     for r in rows:
@@ -757,6 +798,8 @@ def export_line_event_elo(
                 "weighted_arrivals": 0.0,
                 "weighted_lates": 0.0,
                 "weighted_cancellations": 0.0,
+                "weighted_peak_events": 0.0,
+                "weighted_peak_failures": 0.0,
             },
         )
         scores[line_id]["events"] = int(scores[line_id]["events"]) + 1
@@ -777,6 +820,7 @@ def export_line_event_elo(
         event_weight = 1.75 if peak else 1.0
         if peak:
             scores[line_id]["peak_events"] = int(scores[line_id]["peak_events"]) + 1
+            scores[line_id]["weighted_peak_events"] = float(scores[line_id]["weighted_peak_events"]) + event_weight
 
         is_late = False
         if arrived and expected and r["last_seen_utc"]:
@@ -798,14 +842,19 @@ def export_line_event_elo(
             scores[line_id]["late_events"] = int(scores[line_id]["late_events"]) + 1
             scores[line_id]["late_minutes_total"] = float(scores[line_id]["late_minutes_total"]) + (late_seconds / 60.0)
             scores[line_id]["weighted_lates"] = float(scores[line_id]["weighted_lates"]) + event_weight
+            if peak:
+                scores[line_id]["weighted_peak_failures"] = float(scores[line_id]["weighted_peak_failures"]) + (0.8 * event_weight)
         elif overdue and int(r["sightings"] or 0) >= CANCELLATION_MIN_SIGHTINGS:
             scores[line_id]["missed_events"] = int(scores[line_id]["missed_events"]) + 1
             scores[line_id]["weighted_cancellations"] = float(scores[line_id]["weighted_cancellations"]) + event_weight
+            if peak:
+                scores[line_id]["weighted_peak_failures"] = float(scores[line_id]["weighted_peak_failures"]) + (1.3 * event_weight)
         else:
             scores[line_id]["pending_events"] = int(scores[line_id]["pending_events"]) + 1
 
     for line_id, row in scores.items():
-        base_elo = float(seed_map.get(line_id, {}).get("seed_elo", BASE_ELO))
+        seed_elo = float(seed_map.get(line_id, {}).get("seed_elo", BASE_ELO))
+        base_elo = adaptive_base_elo(seed_elo, row)
         row["elo"] = compute_line_elo_update(base_elo, row)
 
     leaderboard = sorted(scores.values(), key=lambda x: float(x["elo"]), reverse=True)
@@ -824,11 +873,11 @@ def export_line_event_elo(
             display_rows.append(
                 {
                     "line_id": row["line_id"],
-                    "line_name": row["line_name"],
+                    "lines": row["line_name"],
                     "elo": row["elo"],
-                    "arrivals": row["arrived_events"],
-                    "lates": row["late_events"],
-                    "cancellations": row["missed_events"],
+                    "on-time arrivals": row["arrived_events"],
+                    "late arrivals": row["late_events"],
+                    "cancelled trains": row["missed_events"],
                 }
             )
 
@@ -836,15 +885,46 @@ def export_line_event_elo(
             f,
             fieldnames=[
                 "line_id",
-                "line_name",
+                "lines",
                 "elo",
-                "arrivals",
-                "lates",
-                "cancellations",
+                "on-time arrivals",
+                "late arrivals",
+                "cancelled trains",
             ],
         )
         writer.writeheader()
         writer.writerows(display_rows)
+
+    snapshot_ts = utc_now_iso()
+    con = sqlite3.connect(db_path, timeout=20)
+    con.execute("PRAGMA busy_timeout=10000")
+    try:
+        for row in rounded_leaderboard:
+            con.execute(
+                """
+                INSERT OR REPLACE INTO line_elo_snapshots (
+                    snapshot_utc,
+                    line_id,
+                    line_name,
+                    elo,
+                    on_time_arrivals,
+                    late_arrivals,
+                    cancelled_trains
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_ts,
+                    str(row["line_id"]),
+                    str(row["line_name"]),
+                    int(row["elo"]),
+                    int(row["arrived_events"]),
+                    int(row["late_events"]),
+                    int(row["missed_events"]),
+                ),
+            )
+        con.commit()
+    finally:
+        con.close()
 
     print("Train-event Elo leaderboard")
     print("=" * 72)

@@ -1,0 +1,12 @@
+line_id,line_name,elo,snapshots,bad_snapshots,status_changes,cancellation_mentions,good_ratio,latest_status,latest_timestamp
+bakerloo,Bakerloo,1523.88,2,0,0,0,1.0,Good Service,2026-03-28T11:18:50.677287+00:00
+central,Central,1523.88,2,0,0,0,1.0,Good Service,2026-03-28T11:18:50.677287+00:00
+district,District,1523.88,2,0,0,0,1.0,Good Service,2026-03-28T11:18:50.677287+00:00
+hammersmith-city,Hammersmith & City,1523.88,2,0,0,0,1.0,Good Service,2026-03-28T11:18:50.677287+00:00
+jubilee,Jubilee,1523.88,2,0,0,0,1.0,Good Service,2026-03-28T11:18:50.677287+00:00
+victoria,Victoria,1523.88,2,0,0,0,1.0,Good Service,2026-03-28T11:18:50.677287+00:00
+piccadilly,Piccadilly,1517.69,2,2,0,0,0.0,Minor Delays,2026-03-28T11:18:50.677287+00:00
+metropolitan,Metropolitan,1498.82,2,2,0,0,0.0,Part Closure,2026-03-28T11:18:50.677287+00:00
+waterloo-city,Waterloo & City,1494.1,2,2,0,0,0.0,Planned Closure,2026-03-28T11:18:50.677287+00:00
+northern,Northern,1489.39,2,2,0,0,0.0,Part Suspended,2026-03-28T11:18:50.677287+00:00
+circle,Circle,1487.81,2,2,0,2,0.0,Severe Delays,2026-03-28T11:18:50.677287+00:00
