@@ -19,9 +19,11 @@ DB_PATH_DEFAULT = "tfl_train_event_elo.db"
 LONDON_TZ = ZoneInfo("Europe/London")
 
 BASE_ELO = 1200.0
-SOFT_FLOOR_ELO = 800.0
-HARD_MIN_ELO = 600.0
-HARD_MAX_ELO = 2000.0
+REVERSION_CENTER_ELO = 1500.0
+MIN_ELO = 1.0
+MAX_ELO = 3500.0
+LOW_EDGE_START = 800.0
+HIGH_EDGE_START = 2500.0
 LATE_GRACE_SECONDS_DEFAULT = 0
 LATE_FULL_LOSS_SECONDS = 900
 ARRIVAL_DETECTED_SECONDS = 180
@@ -453,13 +455,35 @@ def compute_event_delta(elo: float, outcome: str, peak: bool, lateness_seconds: 
 
 def apply_boundary_friction(current_elo: float, raw_delta: float) -> float:
     if raw_delta > 0:
-        drag = 1.0 + max(0.0, (current_elo - 1400.0) / 450.0)
-        drag += max(0.0, (current_elo - 2000.0) / 180.0) * 2.0
+        if current_elo <= HIGH_EDGE_START:
+            return raw_delta
+
+        above = current_elo - HIGH_EDGE_START
+        drag = 1.0 + 0.0014 * (above ** 1.30)
+        if current_elo > 2800.0:
+            drag += 0.9 * math.exp((current_elo - 2800.0) / 160.0)
+        if current_elo > 3000.0:
+            drag += 1.6 * math.exp((current_elo - 3000.0) / 130.0)
+        if current_elo > 3200.0:
+            drag += 3.0 * math.exp((current_elo - 3200.0) / 95.0)
+        if current_elo > 3400.0:
+            drag += 5.0 * math.exp((current_elo - 3400.0) / 75.0)
         return raw_delta / drag
 
     if raw_delta < 0:
-        drag = 1.0 + max(0.0, (900.0 - current_elo) / 350.0)
-        drag += max(0.0, (800.0 - current_elo) / 180.0) * 2.0
+        if current_elo >= LOW_EDGE_START:
+            return raw_delta
+
+        below = LOW_EDGE_START - current_elo
+        drag = 1.0 + 0.0016 * (below ** 1.30)
+        if current_elo < 700.0:
+            drag += 0.9 * math.exp((700.0 - current_elo) / 160.0)
+        if current_elo < 600.0:
+            drag += 1.8 * math.exp((600.0 - current_elo) / 130.0)
+        if current_elo < 500.0:
+            drag += 3.2 * math.exp((500.0 - current_elo) / 95.0)
+        if current_elo < 400.0:
+            drag += 5.0 * math.exp((400.0 - current_elo) / 75.0)
         return raw_delta / drag
 
     return 0.0
@@ -478,26 +502,49 @@ def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) 
     cancel_ratio = w_can / resolved_w
 
     late_avg_minutes = float(row["late_minutes_total"]) / max(1.0, float(row["late_events"]))
-    late_severity = min(1.0, late_avg_minutes / 15.0)
+    late_saturation = 1.0 - math.exp(-max(0.0, late_avg_minutes) / 5.0)
 
     peak_w = float(row["weighted_peak_events"])
     peak_fail_w = float(row["weighted_peak_failures"])
     peak_fail_ratio = peak_fail_w / max(1.0, peak_w)
 
-    late_penalty = 1.60 * late_ratio * (1.0 + late_severity)
-    cancel_ratio_penalty = 4.2 * cancel_ratio
-    peak_penalty = 1.9 * peak_fail_ratio
-    cancel_shock = 0.45 * (1.0 - math.exp(-float(row["missed_events"]) / 5.0))
-    late_shock = 0.24 * (1.0 - math.exp(-float(row["late_events"]) / 14.0))
+    peak_presence = min(1.0, peak_w / 45.0)
 
-    performance = on_time_ratio - late_penalty - cancel_ratio_penalty - peak_penalty - cancel_shock - late_shock
-    qty_bonus = 0.010 * math.log1p(resolved_w)
-    raw_delta = 2100.0 * ((performance - 0.40) + qty_bonus)
+    late_penalty = 0.40 * late_ratio * (0.35 + 0.65 * late_saturation)
+    cancel_ratio_penalty = 3.10 * cancel_ratio
+    peak_penalty = 0.42 * peak_fail_ratio * peak_presence
+    cancel_shock = 0.44 * (1.0 - math.exp(-float(row["missed_events"]) / 6.0))
+    late_shock = 0.04 * (1.0 - math.exp(-float(row["late_events"]) / 30.0))
+    late_count_pressure = 0.013 * math.log1p(float(row["late_events"]))
+    cancel_count_pressure = 0.060 * math.log1p(float(row["missed_events"]))
+    on_time_reward = 0.30 * on_time_ratio
 
-    confidence = min(1.0, math.sqrt(resolved_w) / 18.0)
+    performance = (
+        on_time_ratio
+        + on_time_reward
+        + 0.28
+        - late_penalty
+        - cancel_ratio_penalty
+        - peak_penalty
+        - cancel_shock
+        - late_shock
+        - late_count_pressure
+        - cancel_count_pressure
+    )
+    qty_bonus = 0.002 * math.log1p(resolved_w)
+    raw_delta = 820.0 * ((performance - 0.56) + qty_bonus)
+
+    confidence = min(1.0, math.sqrt(resolved_w) / 14.0)
     raw_delta *= confidence
 
-    return base_elo + apply_boundary_friction(base_elo, raw_delta)
+    reversion_confidence = min(1.0, math.sqrt(resolved_w) / 28.0)
+    reversion_strength = 0.18 * ((1.0 - reversion_confidence) ** 2.2)
+    raw_delta += (REVERSION_CENTER_ELO - base_elo) * reversion_strength
+
+    next_elo = base_elo + apply_boundary_friction(base_elo, raw_delta)
+    next_elo = max(MIN_ELO, next_elo)
+    next_elo = min(MAX_ELO, next_elo)
+    return next_elo
 
 
 def adaptive_base_elo(seed_elo: float, row: Dict[str, float | int | str]) -> float:
@@ -693,22 +740,27 @@ def run_monitor_loop(
     i = 0
     while True:
         i += 1
-        collect_once(
-            db_path=db_path,
-            mode=mode,
-            line_ids=line_ids,
-            max_stops_per_line=max_stops_per_line,
-            app_id=app_id,
-            app_key=app_key,
-        )
-        export_line_event_elo(
-            db_path=db_path,
-            out_csv=out_csv,
-            mode=mode,
-            grace_seconds=grace_seconds,
-            late_grace_seconds=late_grace_seconds,
-            lookback_hours=lookback_hours,
-        )
+        try:
+            collect_once(
+                db_path=db_path,
+                mode=mode,
+                line_ids=line_ids,
+                max_stops_per_line=max_stops_per_line,
+                app_id=app_id,
+                app_key=app_key,
+            )
+            export_line_event_elo(
+                db_path=db_path,
+                out_csv=out_csv,
+                mode=mode,
+                grace_seconds=grace_seconds,
+                late_grace_seconds=late_grace_seconds,
+                lookback_hours=lookback_hours,
+            )
+        except sqlite3.OperationalError as exc:
+            print(f"[warn] monitor cycle sqlite error: {exc}")
+        except Exception as exc:
+            print(f"[warn] monitor cycle error: {exc}")
         if iterations > 0 and i >= iterations:
             break
         time.sleep(interval_seconds)

@@ -3,7 +3,7 @@ import time
 import math
 import json
 from html import escape
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -11,6 +11,11 @@ from zoneinfo import ZoneInfo
 
 LONDON_TZ = ZoneInfo("Europe/London")
 BASE_ELO = 1200.0
+REVERSION_CENTER_ELO = 1500.0
+MIN_ELO = 1.0
+MAX_ELO = 3500.0
+LOW_EDGE_START = 800.0
+HIGH_EDGE_START = 2500.0
 LATE_GRACE_SECONDS_DEFAULT = 0
 LATE_FULL_LOSS_SECONDS = 900
 ARRIVAL_DETECTED_SECONDS = 180
@@ -288,6 +293,10 @@ def fetch_elo_snapshots_for_lines(db_path: str, line_ids: List[str], lookback_ho
     return []
 
 
+def fetch_elo_snapshots_for_line(db_path: str, line_id: str, lookback_hours: int) -> List[sqlite3.Row]:
+    return fetch_elo_snapshots_for_lines(db_path=db_path, line_ids=[line_id], lookback_hours=lookback_hours)
+
+
 def compute_leaderboard(
     events: List[sqlite3.Row],
     seeds: List[sqlite3.Row],
@@ -410,13 +419,35 @@ def compute_leaderboard(
 
 def apply_boundary_friction(current_elo: float, raw_delta: float) -> float:
     if raw_delta > 0:
-        drag = 1.0 + max(0.0, (current_elo - 1400.0) / 450.0)
-        drag += max(0.0, (current_elo - 2000.0) / 180.0) * 2.0
+        if current_elo <= HIGH_EDGE_START:
+            return raw_delta
+
+        above = current_elo - HIGH_EDGE_START
+        drag = 1.0 + 0.0014 * (above ** 1.30)
+        if current_elo > 2800.0:
+            drag += 0.9 * math.exp((current_elo - 2800.0) / 160.0)
+        if current_elo > 3000.0:
+            drag += 1.6 * math.exp((current_elo - 3000.0) / 130.0)
+        if current_elo > 3200.0:
+            drag += 3.0 * math.exp((current_elo - 3200.0) / 95.0)
+        if current_elo > 3400.0:
+            drag += 5.0 * math.exp((current_elo - 3400.0) / 75.0)
         return raw_delta / drag
 
     if raw_delta < 0:
-        drag = 1.0 + max(0.0, (900.0 - current_elo) / 350.0)
-        drag += max(0.0, (800.0 - current_elo) / 180.0) * 2.0
+        if current_elo >= LOW_EDGE_START:
+            return raw_delta
+
+        below = LOW_EDGE_START - current_elo
+        drag = 1.0 + 0.0016 * (below ** 1.30)
+        if current_elo < 700.0:
+            drag += 0.9 * math.exp((700.0 - current_elo) / 160.0)
+        if current_elo < 600.0:
+            drag += 1.8 * math.exp((600.0 - current_elo) / 130.0)
+        if current_elo < 500.0:
+            drag += 3.2 * math.exp((500.0 - current_elo) / 95.0)
+        if current_elo < 400.0:
+            drag += 5.0 * math.exp((400.0 - current_elo) / 75.0)
         return raw_delta / drag
 
     return 0.0
@@ -451,25 +482,48 @@ def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) 
     cancel_ratio = w_can / resolved_w
 
     late_avg_minutes = float(row["late_minutes_total"]) / max(1.0, float(row["late_events"]))
-    late_severity = min(1.0, late_avg_minutes / 15.0)
+    late_saturation = 1.0 - math.exp(-max(0.0, late_avg_minutes) / 5.0)
 
     peak_w = float(row["weighted_peak_events"])
     peak_fail_w = float(row["weighted_peak_failures"])
     peak_fail_ratio = peak_fail_w / max(1.0, peak_w)
 
-    late_penalty = 1.60 * late_ratio * (1.0 + late_severity)
-    cancel_ratio_penalty = 4.2 * cancel_ratio
-    peak_penalty = 1.9 * peak_fail_ratio
-    cancel_shock = 0.45 * (1.0 - math.exp(-float(row["missed_events"]) / 5.0))
-    late_shock = 0.24 * (1.0 - math.exp(-float(row["late_events"]) / 14.0))
+    peak_presence = min(1.0, peak_w / 45.0)
 
-    performance = on_time_ratio - late_penalty - cancel_ratio_penalty - peak_penalty - cancel_shock - late_shock
-    qty_bonus = 0.010 * math.log1p(resolved_w)
-    raw_delta = 2100.0 * ((performance - 0.40) + qty_bonus)
-    confidence = min(1.0, math.sqrt(resolved_w) / 18.0)
+    late_penalty = 0.40 * late_ratio * (0.35 + 0.65 * late_saturation)
+    cancel_ratio_penalty = 3.10 * cancel_ratio
+    peak_penalty = 0.42 * peak_fail_ratio * peak_presence
+    cancel_shock = 0.44 * (1.0 - math.exp(-float(row["missed_events"]) / 6.0))
+    late_shock = 0.04 * (1.0 - math.exp(-float(row["late_events"]) / 30.0))
+    late_count_pressure = 0.013 * math.log1p(float(row["late_events"]))
+    cancel_count_pressure = 0.060 * math.log1p(float(row["missed_events"]))
+    on_time_reward = 0.30 * on_time_ratio
+
+    performance = (
+        on_time_ratio
+        + on_time_reward
+        + 0.28
+        - late_penalty
+        - cancel_ratio_penalty
+        - peak_penalty
+        - cancel_shock
+        - late_shock
+        - late_count_pressure
+        - cancel_count_pressure
+    )
+    qty_bonus = 0.002 * math.log1p(resolved_w)
+    raw_delta = 820.0 * ((performance - 0.56) + qty_bonus)
+    confidence = min(1.0, math.sqrt(resolved_w) / 14.0)
     raw_delta *= confidence
 
-    return base_elo + apply_boundary_friction(base_elo, raw_delta)
+    reversion_confidence = min(1.0, math.sqrt(resolved_w) / 28.0)
+    reversion_strength = 0.18 * ((1.0 - reversion_confidence) ** 2.2)
+    raw_delta += (REVERSION_CENTER_ELO - base_elo) * reversion_strength
+
+    next_elo = base_elo + apply_boundary_friction(base_elo, raw_delta)
+    next_elo = max(MIN_ELO, next_elo)
+    next_elo = min(MAX_ELO, next_elo)
+    return next_elo
 
 
 def adaptive_base_elo(seed_elo: float, row: Dict[str, float | int | str]) -> float:
@@ -719,7 +773,7 @@ def render_line_chart_page(db_path: str, mode: str, grace_seconds: int, late_gra
         format_func=lambda x: names.get(x, x),
         key="line_chart_lines",
     )
-    hours = c2.slider("Hours", min_value=3, max_value=48, value=6, step=1, key="line_chart_hours")
+    hours = c2.slider("Hours", min_value=1, max_value=48, value=6, step=1, key="line_chart_hours")
 
     if not selected_lines:
         st.info("Select at least one line to plot Elo over time.")
@@ -758,6 +812,9 @@ def render_line_chart_page(db_path: str, mode: str, grace_seconds: int, late_gra
     y_max = max(elo_vals)
     pad = max(10.0, (y_max - y_min) * 0.12)
     y_domain = [round(y_min - pad, 2), round(y_max + pad, 2)]
+    window_end = datetime.now(LONDON_TZ)
+    window_start = window_end - timedelta(hours=hours)
+    x_domain = [window_start.isoformat(), window_end.isoformat()]
 
     spec = {
         "mark": {"type": "line", "point": True},
@@ -765,7 +822,8 @@ def render_line_chart_page(db_path: str, mode: str, grace_seconds: int, late_gra
             "x": {
                 "field": "time",
                 "type": "temporal",
-                "axis": {"title": f"Time ({tz_now})", "labelAngle": -45},
+                "scale": {"domain": x_domain},
+                "axis": {"title": f"Time ({tz_now})", "labelAngle": -45, "format": "%d %b %H:%M"},
             },
             "y": {
                 "field": "elo",
@@ -776,7 +834,7 @@ def render_line_chart_page(db_path: str, mode: str, grace_seconds: int, late_gra
             "color": {"field": "line", "type": "nominal", "legend": {"title": "Line"}},
             "tooltip": [
                 {"field": "line", "type": "nominal"},
-                {"field": "time", "type": "temporal"},
+                {"field": "time", "type": "temporal", "format": "%Y-%m-%d %H:%M"},
                 {"field": "elo", "type": "quantitative"},
             ],
         },
@@ -793,49 +851,46 @@ def render_candle_chart_page(db_path: str, mode: str, grace_seconds: int, late_g
     names = {line_id: line_name for line_id, line_name in ALL_TUBE_LINES}
     c1, c2 = st.columns([2, 1])
     line_id = c1.selectbox("Line", options=[x[0] for x in ALL_TUBE_LINES], format_func=lambda x: names.get(x, x), key="candle_line")
-    hours = c2.slider("Hours", min_value=6, max_value=72, value=24, step=1, key="candle_hours")
+    hours = c2.slider("Hours", min_value=1, max_value=72, value=24, step=1, key="candle_hours")
 
-    rows = fetch_line_events_for_hours(db_path=db_path, mode=mode, line_id=line_id, lookback_hours=hours)
-    now_ts = datetime.now(timezone.utc).timestamp()
+    rows = fetch_elo_snapshots_for_line(db_path=db_path, line_id=line_id, lookback_hours=hours)
+    if not rows:
+        st.info("No Elo snapshot data available for this line/time window yet.")
+        return
 
-    buckets: Dict[str, Dict[str, int]] = {}
+    buckets: Dict[datetime, List[tuple[datetime, float]]] = {}
     for r in rows:
         try:
-            dt = datetime.fromisoformat(str(r["expected_arrival_utc"]).replace("Z", "+00:00"))
+            dt_utc = datetime.fromisoformat(str(r["snapshot_utc"]).replace("Z", "+00:00"))
         except Exception:
             continue
-        key = dt.strftime("%m-%d %H:00")
-        b = buckets.setdefault(key, {"on": 0, "late": 0, "can": 0})
-        cls = classify_event(r, now_ts=now_ts, grace_seconds=grace_seconds, late_grace_seconds=late_grace_seconds)
-        if cls == "ontime":
-            b["on"] += 1
-        elif cls == "late":
-            b["late"] += 1
-        elif cls == "cancelled":
-            b["can"] += 1
+        dt_local = dt_utc.astimezone(LONDON_TZ)
+        bucket = dt_local.replace(minute=0, second=0, microsecond=0)
+        buckets.setdefault(bucket, []).append((dt_local, float(r["elo"])))
 
-    keys = sorted(buckets.keys())
-    if not keys:
-        st.info("No data available for this line/time window yet.")
+    if not buckets:
+        st.info("No Elo snapshot data available for this line/time window yet.")
         return
 
     candles = []
-    prev_close = 1500.0
-    for k in keys:
-        b = buckets[k]
-        total = b["on"] + b["late"] + b["can"]
-        if total <= 0:
-            delta = 0.0
-        else:
-            quality = (b["on"] / total) - (1.4 * b["late"] / total) - (2.6 * b["can"] / total)
-            delta = 120.0 * (quality - 0.35)
-        o = prev_close
-        c = prev_close + delta
-        wiggle = 20.0 + 8.0 * (b["late"] + b["can"])
-        h = max(o, c) + wiggle
-        l = min(o, c) - wiggle
-        candles.append({"time": k, "open": round(o, 2), "high": round(h, 2), "low": round(l, 2), "close": round(c, 2)})
-        prev_close = c
+    for bucket in sorted(buckets.keys()):
+        points = sorted(buckets[bucket], key=lambda x: x[0])
+        if not points:
+            continue
+        vals = [x[1] for x in points]
+        candles.append(
+            {
+                "time": bucket.isoformat(),
+                "open": round(vals[0], 2),
+                "high": round(max(vals), 2),
+                "low": round(min(vals), 2),
+                "close": round(vals[-1], 2),
+            }
+        )
+
+    if len(candles) < 2:
+        st.info("Not enough Elo history yet for candlesticks. Keep the monitor running for more snapshots.")
+        return
 
     lows = [float(c["low"]) for c in candles]
     highs = [float(c["high"]) for c in candles]
@@ -844,13 +899,29 @@ def render_candle_chart_page(db_path: str, mode: str, grace_seconds: int, late_g
     span = y_max - y_min
     pad = max(8.0, span * 0.12)
     y_domain = [round(y_min - pad, 2), round(y_max + pad, 2)]
+    first_bucket_local = datetime.fromisoformat(str(candles[0]["time"]))
+    window_start = first_bucket_local
+    window_end = window_start + timedelta(hours=hours)
+    x_domain = [window_start.isoformat(), window_end.isoformat()]
+    window_end = datetime.now(LONDON_TZ)
+    window_start = window_end - timedelta(hours=hours)
+    x_domain = [window_start.isoformat(), window_end.isoformat()]
 
     spec = {
         "layer": [
             {
                 "mark": {"type": "rule", "color": "#9ca3af"},
                 "encoding": {
-                    "x": {"field": "time", "type": "ordinal", "axis": {"labelAngle": -45}},
+                    "x": {
+                        "field": "time",
+                        "type": "temporal",
+                        "scale": {"domain": x_domain},
+                        "axis": {
+                            "labelAngle": -45,
+                            "title": f"Time ({datetime.now(LONDON_TZ).tzname() or 'UK'})",
+                            "format": "%d %b %H:%M",
+                        },
+                    },
                     "y": {
                         "field": "low",
                         "type": "quantitative",
@@ -863,9 +934,16 @@ def render_candle_chart_page(db_path: str, mode: str, grace_seconds: int, late_g
             {
                 "mark": {"type": "bar"},
                 "encoding": {
-                    "x": {"field": "time", "type": "ordinal"},
+                    "x": {"field": "time", "type": "temporal", "scale": {"domain": x_domain}},
                     "y": {"field": "open", "type": "quantitative", "scale": {"domain": y_domain, "zero": False}},
                     "y2": {"field": "close"},
+                    "tooltip": [
+                        {"field": "time", "type": "temporal", "format": "%Y-%m-%d %H:%M"},
+                        {"field": "open", "type": "quantitative"},
+                        {"field": "high", "type": "quantitative"},
+                        {"field": "low", "type": "quantitative"},
+                        {"field": "close", "type": "quantitative"},
+                    ],
                     "color": {
                         "condition": {"test": "datum.close >= datum.open", "value": "#22c55e"},
                         "value": "#ef4444",
@@ -876,7 +954,7 @@ def render_candle_chart_page(db_path: str, mode: str, grace_seconds: int, late_g
         "height": 380,
     }
     st.vega_lite_chart(candles, spec, use_container_width=True)
-    st.caption("Candles show hourly Elo momentum proxy (green up, red down).")
+    st.caption("Candles show real hourly Elo OHLC from persisted snapshots (green up, red down).")
 
 
 def render_why_page() -> None:
@@ -900,11 +978,18 @@ def main() -> None:
     import importlib
 
     st = importlib.import_module("streamlit")
+    logo_bg = "#070b12"
+    logo_blue = "#1015a8"
 
     st.set_page_config(page_title="TfL Train Event Elo", layout="wide", initial_sidebar_state="collapsed")
     st.markdown(
         """
         <style>
+          .stApp,
+          [data-testid="stAppViewContainer"] {
+            background: #070b12 !important;
+            color: #e5e7eb !important;
+          }
           [data-testid="stToolbar"],
           [data-testid="stHeaderActionElements"],
           button[title="Deploy"] {
@@ -928,7 +1013,23 @@ def main() -> None:
 
     top_left, top_right = st.columns([1.8, 1.2])
     with top_left:
-        st.markdown("<h1 style='margin-top:0.1rem; margin-bottom:0;'>TfL Train Event Elo Dashboard</h1>", unsafe_allow_html=True)
+        logo_col, text_col = st.columns([1.0, 2.3])
+        with logo_col:
+            st.markdown(
+                f"""
+                <div style="width:220px; max-width:100%; background:{logo_bg}; padding:4px 0;">
+                  <svg viewBox="0 0 820 420" width="100%" role="img" aria-label="TfL Elo logo">
+                    <rect x="0" y="0" width="820" height="420" fill="{logo_bg}"/>
+                    <ellipse cx="410" cy="210" rx="305" ry="155" fill="none" stroke="{logo_blue}" stroke-width="72"/>
+                    <rect x="0" y="175" width="820" height="70" fill="{logo_blue}"/>
+                    <text x="410" y="223" text-anchor="middle" fill="#ffffff" font-size="44" font-family="Arial, sans-serif" font-weight="700">TFL ELO</text>
+                  </svg>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with text_col:
+            st.subheader("TfL Train Event ELO Dashboard")
     with top_right:
         selected = st.segmented_control(
             label="Views",
