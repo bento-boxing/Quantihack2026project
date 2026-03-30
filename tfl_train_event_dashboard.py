@@ -720,6 +720,58 @@ def fetch_events_for_lines_hours(db_path: str, mode: str, line_ids: List[str], l
         con.close()
 
 
+def fetch_detailed_event_rows_for_lines(
+    db_path: str,
+    mode: str,
+    line_ids: List[str],
+    lookback_hours: int,
+    limit_rows: int,
+) -> List[sqlite3.Row]:
+    if not line_ids:
+        return []
+
+    con = sqlite3.connect(db_path, timeout=1)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout=800")
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_raw_event_snapshot ON train_predictions_raw(event_id, snapshot_ts_utc, id)"
+        )
+        placeholders = ",".join(["?"] * len(line_ids))
+        params: List[object] = [mode]
+        params.extend(line_ids)
+
+        sql = (
+            "SELECT "
+            "event_id, line_id, line_name, station_name, platform_name, direction, destination_name, "
+            "expected_arrival_utc, first_seen_utc, last_seen_utc, min_time_to_station, sightings, "
+            "(SELECT rr.current_location FROM train_predictions_raw rr WHERE rr.event_id = train_stop_events.event_id "
+            " ORDER BY rr.snapshot_ts_utc DESC, rr.id DESC LIMIT 1) AS current_location, "
+            "(SELECT rr.station_name FROM train_predictions_raw rr WHERE rr.event_id = train_stop_events.event_id "
+            " ORDER BY rr.snapshot_ts_utc DESC, rr.id DESC LIMIT 1) AS raw_station_name, "
+            "COALESCE(last_seen_utc, expected_arrival_utc) AS activity_utc "
+            "FROM train_stop_events "
+            "WHERE mode_name = ? "
+            f"AND line_id IN ({placeholders}) "
+            "AND expected_arrival_utc IS NOT NULL "
+        )
+        if lookback_hours > 0:
+            cutoff = datetime.now(timezone.utc).timestamp() - (lookback_hours * 3600)
+            cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+            sql += "AND expected_arrival_utc >= ? "
+            params.append(cutoff_iso)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        sql += "AND expected_arrival_utc <= ? "
+        params.append(now_iso)
+
+        sql += "ORDER BY activity_utc DESC, expected_arrival_utc DESC, event_id DESC LIMIT ?"
+        params.append(int(limit_rows))
+        return con.execute(sql, params).fetchall()
+    finally:
+        con.close()
+
+
 def fetch_seed_map(db_path: str) -> Dict[str, float]:
     con = sqlite3.connect(db_path, timeout=1)
     con.row_factory = sqlite3.Row
@@ -734,7 +786,7 @@ def fetch_seed_map(db_path: str) -> Dict[str, float]:
 def classify_event(row: sqlite3.Row, now_ts: float, grace_seconds: int, late_grace_seconds: int) -> str:
     expected = row["expected_arrival_utc"]
     min_tts = row["min_time_to_station"]
-    arrived = (min_tts is not None) and (int(min_tts) <= ARRIVAL_DETECTED_SECONDS)
+    arrived_signal = (min_tts is not None) and (int(min_tts) <= ARRIVAL_DETECTED_SECONDS)
 
     overdue = False
     exp_ts = None
@@ -744,6 +796,8 @@ def classify_event(row: sqlite3.Row, now_ts: float, grace_seconds: int, late_gra
             overdue = now_ts > (exp_ts + grace_seconds)
         except Exception:
             overdue = False
+
+    arrived = arrived_signal and (exp_ts is None or now_ts >= exp_ts)
 
     if arrived and expected and row["last_seen_utc"] and exp_ts is not None:
         try:
@@ -758,6 +812,53 @@ def classify_event(row: sqlite3.Row, now_ts: float, grace_seconds: int, late_gra
         return "cancelled"
 
     return "pending"
+
+
+def classify_event_for_feed(row: sqlite3.Row, now_ts: float, grace_seconds: int, late_grace_seconds: int) -> str:
+    expected = row["expected_arrival_utc"]
+    if not expected:
+        return "pending"
+
+    try:
+        exp_ts = datetime.fromisoformat(str(expected).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return "pending"
+
+    min_tts = row["min_time_to_station"]
+    arrived_signal = (min_tts is not None) and (int(min_tts) <= ARRIVAL_DETECTED_SECONDS)
+
+    if arrived_signal and row["last_seen_utc"] is not None and now_ts >= exp_ts:
+        try:
+            last_seen_ts = datetime.fromisoformat(str(row["last_seen_utc"]).replace("Z", "+00:00")).timestamp()
+            if last_seen_ts > (exp_ts + late_grace_seconds):
+                return "late"
+            return "ontime"
+        except Exception:
+            return "ontime"
+
+    if now_ts > (exp_ts + grace_seconds) and int(row["sightings"] or 0) >= CANCELLATION_MIN_SIGHTINGS:
+        return "cancelled"
+
+    return "pending"
+
+
+def resolve_station_for_event(row: sqlite3.Row) -> str:
+    location = str(row["current_location"] or "").strip()
+    if location.startswith("At "):
+        station = location[3:].strip()
+        if " Platform " in station:
+            station = station.split(" Platform ", 1)[0].strip()
+        if station:
+            return station
+    if location.startswith("Left "):
+        station = location[5:].strip()
+        if station:
+            return station
+
+    raw_station = str(row["raw_station_name"] or "").strip()
+    if raw_station:
+        return raw_station
+    return str(row["station_name"] or "-")
 
 
 def render_line_chart_page(db_path: str, mode: str, grace_seconds: int, late_grace_seconds: int) -> None:
@@ -957,6 +1058,274 @@ def render_candle_chart_page(db_path: str, mode: str, grace_seconds: int, late_g
     st.caption("Candles show real hourly Elo OHLC from persisted snapshots (green up, red down).")
 
 
+@__import__("streamlit").fragment(run_every="5s")
+def render_events_page(db_path: str, mode: str, grace_seconds: int, late_grace_seconds: int) -> None:
+    st = __import__("streamlit")
+    components = st.components.v1
+    st.subheader("Events")
+
+    names = {line_id: line_name for line_id, line_name in ALL_TUBE_LINES}
+    c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+    selected_lines = c1.multiselect(
+        "Choose line(s)",
+        options=[x[0] for x in ALL_TUBE_LINES],
+        default=[x[0] for x in ALL_TUBE_LINES],
+        format_func=lambda x: names.get(x, x),
+        key="events_lines",
+    )
+    hours = c2.slider("Hours", min_value=1, max_value=72, value=6, step=1, key="events_hours")
+    limit_rows = c3.slider("Rows", min_value=200, max_value=5000, value=1200, step=100, key="events_limit")
+    muted = c4.checkbox("Mute alerts", value=False, key="events_mute")
+    selected_event_types = st.multiselect(
+        "Event types",
+        options=["ARRIVED", "LATE ALERT", "CANCELLED ALERT"],
+        default=["ARRIVED", "LATE ALERT", "CANCELLED ALERT"],
+        key="events_types",
+    )
+
+    if not selected_lines:
+        st.info("Select at least one line to view events.")
+        return
+    if not selected_event_types:
+        st.info("Select at least one event type to display.")
+        return
+
+    live_status = fetch_live_line_status(mode)
+    prev_status = st.session_state.get("_events_prev_status_map", {})
+    status_changes: List[str] = []
+    for line_id in selected_lines:
+        prev_desc = str((prev_status.get(line_id) or {}).get("desc") or "")
+        curr_desc = str((live_status.get(line_id) or {}).get("desc") or "")
+        if prev_desc and curr_desc and prev_desc != curr_desc:
+            status_changes.append(f"{names.get(line_id, line_id)}: {prev_desc} -> {curr_desc}")
+    st.session_state["_events_prev_status_map"] = live_status
+
+    if status_changes:
+        st.warning("Status changes detected:\n- " + "\n- ".join(status_changes))
+
+    rows = fetch_detailed_event_rows_for_lines(
+        db_path=db_path,
+        mode=mode,
+        line_ids=selected_lines,
+        lookback_hours=hours,
+        limit_rows=limit_rows,
+    )
+    if not rows:
+        st.info("No events found for selected lines/time window.")
+        return
+
+    try:
+        latest_activity_local = datetime.fromisoformat(str(rows[0]["activity_utc"]).replace("Z", "+00:00")).astimezone(LONDON_TZ)
+        st.caption(f"Live feed updated through {latest_activity_local.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    except Exception:
+        pass
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    table_rows: List[str] = []
+    event_labels_by_key: Dict[str, str] = {}
+    current_event_keys: set[str] = set()
+    shown = 0
+    for r in rows:
+        event_type = classify_event_for_feed(r, now_ts=now_ts, grace_seconds=grace_seconds, late_grace_seconds=late_grace_seconds)
+
+        shown += 1
+        line_id = str(r["line_id"] or "")
+        line_name = str(r["line_name"] or names.get(line_id, line_id))
+        station = resolve_station_for_event(r)
+        platform = str(r["platform_name"] or "-")
+        destination = str(r["destination_name"] or "-")
+        sightings = int(r["sightings"] or 0)
+
+        try:
+            exp_local = datetime.fromisoformat(str(r["expected_arrival_utc"]).replace("Z", "+00:00")).astimezone(LONDON_TZ)
+            exp_txt = exp_local.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            exp_txt = str(r["expected_arrival_utc"] or "-")
+
+        seen_txt = "-"
+        if r["last_seen_utc"]:
+            try:
+                seen_local = datetime.fromisoformat(str(r["last_seen_utc"]).replace("Z", "+00:00")).astimezone(LONDON_TZ)
+                seen_txt = seen_local.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                seen_txt = str(r["last_seen_utc"])
+
+        activity_txt = "-"
+        if r["activity_utc"]:
+            try:
+                activity_local = datetime.fromisoformat(str(r["activity_utc"]).replace("Z", "+00:00")).astimezone(LONDON_TZ)
+                activity_txt = activity_local.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                activity_txt = str(r["activity_utc"])
+
+        status_info = live_status.get(line_id, {"desc": "Unknown", "color": "#9ca3af"})
+        status_desc = str(status_info.get("desc") or "Unknown")
+        status_color = str(status_info.get("color") or "#9ca3af")
+
+        if event_type == "ontime":
+            event_label = "ARRIVED"
+            row_bg = "rgba(34, 197, 94, 0.14)"
+            row_border = "#22c55e"
+        elif event_type == "late":
+            event_label = "LATE ALERT"
+            row_bg = "rgba(249, 115, 22, 0.18)"
+            row_border = "#f97316"
+        elif event_type == "cancelled":
+            event_label = "CANCELLED ALERT"
+            row_bg = "rgba(239, 68, 68, 0.20)"
+            row_border = "#ef4444"
+        else:
+            continue
+
+        if event_label not in selected_event_types:
+            continue
+
+        event_key = f"{str(r['event_id'])}|{event_label}"
+        current_event_keys.add(event_key)
+        event_labels_by_key[event_key] = event_label
+
+        line_colors = LINE_BOX_COLORS.get(line_id, {"bg": "#1f2937", "fg": "#ffffff"})
+        line_chip = (
+            f"<span style='display:inline-block; padding:2px 8px; border-radius:6px;"
+            f" background:{line_colors['bg']}; color:{line_colors['fg']}; font-weight:600;'>"
+            f"{escape(line_name)}</span>"
+        )
+
+        table_rows.append(
+            "<tr style='background:" + row_bg + "; border-left:4px solid " + row_border + ";'>"
+            f"<td style='padding:8px 10px; white-space:nowrap;'>{escape(exp_txt)}</td>"
+            f"<td style='padding:8px 10px;'>{line_chip}</td>"
+            f"<td style='padding:8px 10px;'>{escape(station)}</td>"
+            f"<td style='padding:8px 10px;'>{escape(platform)}</td>"
+            f"<td style='padding:8px 10px;'>{escape(destination)}</td>"
+            f"<td style='padding:8px 10px; font-weight:700;'>{escape(event_label)}</td>"
+            f"<td style='padding:8px 10px; white-space:nowrap;'><span style='color:{status_color};'>●</span> {escape(status_desc)}</td>"
+            f"<td style='padding:8px 10px; white-space:nowrap;'>{escape(activity_txt)}</td>"
+            f"<td style='padding:8px 10px; white-space:nowrap;'>{escape(seen_txt)}</td>"
+            f"<td style='padding:8px 10px; text-align:right;'>{sightings}</td>"
+            "</tr>"
+        )
+
+    if shown == 0:
+        st.info("No arrived/late/cancelled events yet in this window.")
+        return
+
+    signature = "|".join(sorted(selected_lines)) + f"|h={hours}|l={limit_rows}|t={','.join(sorted(selected_event_types))}"
+    prev_signature = str(st.session_state.get("_events_audio_signature") or "")
+    prev_seen = set(st.session_state.get("_events_seen_keys") or [])
+    play_arrived = 0
+    play_late = 0
+    play_bad = 0
+
+    if prev_signature != signature:
+        st.session_state["_events_audio_signature"] = signature
+        st.session_state["_events_seen_keys"] = list(current_event_keys)
+    else:
+        new_keys = current_event_keys - prev_seen
+        for k in new_keys:
+            label = event_labels_by_key.get(k)
+            if label == "ARRIVED":
+                play_arrived += 1
+            elif label == "LATE ALERT":
+                play_late += 1
+            elif label == "CANCELLED ALERT":
+                play_bad += 1
+
+        merged = list(prev_seen.union(current_event_keys))
+        if len(merged) > 20000:
+            merged = merged[-20000:]
+        st.session_state["_events_seen_keys"] = merged
+
+    table_html = [
+        "<div style='max-height:560px; overflow-y:auto; border:1px solid #1f2937; border-radius:10px;'>",
+        "<table style='width:100%; border-collapse:collapse; min-width:1250px;'>",
+        "<thead style='position:sticky; top:0; background:#0b1220; z-index:2;'>",
+        "<tr>",
+        "<th style='text-align:left; padding:8px 10px;'>expected ETA (BST)</th>",
+        "<th style='text-align:left; padding:8px 10px;'>line</th>",
+        "<th style='text-align:left; padding:8px 10px;'>station</th>",
+        "<th style='text-align:left; padding:8px 10px;'>platform</th>",
+        "<th style='text-align:left; padding:8px 10px;'>destination</th>",
+        "<th style='text-align:left; padding:8px 10px;'>event</th>",
+        "<th style='text-align:left; padding:8px 10px;'>current line status</th>",
+        "<th style='text-align:left; padding:8px 10px;'>activity (BST)</th>",
+        "<th style='text-align:left; padding:8px 10px;'>last seen (BST)</th>",
+        "<th style='text-align:right; padding:8px 10px;'>sightings</th>",
+        "</tr></thead><tbody>",
+    ]
+    table_html.extend(table_rows)
+    table_html.append("</tbody></table></div>")
+    st.markdown("".join(table_html), unsafe_allow_html=True)
+    st.caption("Green = arrived, orange = late alert, red = cancelled alert. Feed is sorted by latest activity first.")
+
+    status_alert_count = len(status_changes)
+    if (not muted) and (play_arrived > 0 or play_late > 0 or play_bad > 0 or status_alert_count > 0):
+        payload = {
+            "arrived": play_arrived,
+            "late": play_late,
+            "bad": play_bad,
+            "status": status_alert_count,
+        }
+        components.html(
+            f"""
+            <script>
+            (function() {{
+              const p = {json.dumps(payload)};
+              if (document.visibilityState !== 'visible') return;
+              const Ctx = window.AudioContext || window.webkitAudioContext;
+              if (!Ctx) return;
+              const ctx = new Ctx();
+              const now = ctx.currentTime + 0.01;
+
+              function tone(freq, dur, type, gain, start) {{
+                const o = ctx.createOscillator();
+                const g = ctx.createGain();
+                o.type = type;
+                o.frequency.setValueAtTime(freq, start);
+                g.gain.setValueAtTime(0.0001, start);
+                g.gain.exponentialRampToValueAtTime(gain, start + 0.01);
+                g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+                o.connect(g); g.connect(ctx.destination);
+                o.start(start); o.stop(start + dur + 0.02);
+              }}
+
+              function playArrived(n, t0) {{
+                for (let i = 0; i < Math.min(n, 3); i++) {{
+                  const t = t0 + i * 0.10;
+                  tone(760, 0.08, 'sine', 0.018, t);
+                  tone(960, 0.10, 'sine', 0.015, t + 0.08);
+                }}
+              }}
+
+              function playLate(n, t0) {{
+                for (let i = 0; i < Math.min(n, 3); i++) {{
+                  const t = t0 + i * 0.14;
+                  tone(500, 0.10, 'triangle', 0.017, t);
+                  tone(360, 0.12, 'sawtooth', 0.013, t + 0.09);
+                }}
+              }}
+
+              function playBad(n, t0) {{
+                for (let i = 0; i < Math.min(n, 2); i++) {{
+                  const t = t0 + i * 0.20;
+                  tone(180, 0.16, 'sawtooth', 0.020, t);
+                  tone(150, 0.18, 'square', 0.012, t + 0.08);
+                }}
+              }}
+
+              let cursor = now;
+              if (p.arrived > 0) {{ playArrived(p.arrived, cursor); cursor += 0.28; }}
+              if (p.late > 0) {{ playLate(p.late, cursor); cursor += 0.36; }}
+              const harsh = p.bad + p.status;
+              if (harsh > 0) {{ playBad(harsh, cursor); }}
+            }})();
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
+
+
 def render_why_page() -> None:
     st = __import__("streamlit")
     st.subheader("Why?")
@@ -1005,7 +1374,7 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    page_options = ["Elo leaderboard", "Line Chart", "Candle Chart", "Why?"]
+    page_options = ["Elo leaderboard", "Line Chart", "Candle Chart", "Events", "Why?"]
     if "active_page" not in st.session_state:
         st.session_state["active_page"] = "Elo leaderboard"
     if "last_page_switch_ts" not in st.session_state:
@@ -1029,7 +1398,7 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
         with text_col:
-            st.subheader("TfL Train Event ELO Dashboard")
+            st.subheader("TfL Train ELO Dashboard")
     with top_right:
         selected = st.segmented_control(
             label="Views",
@@ -1075,6 +1444,13 @@ def main() -> None:
         )
     elif active_page == "Candle Chart":
         render_candle_chart_page(
+            db_path=db_path,
+            mode=mode,
+            grace_seconds=grace_seconds,
+            late_grace_seconds=late_grace_seconds,
+        )
+    elif active_page == "Events":
+        render_events_page(
             db_path=db_path,
             mode=mode,
             grace_seconds=grace_seconds,

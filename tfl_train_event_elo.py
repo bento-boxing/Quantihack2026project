@@ -143,6 +143,12 @@ def init_db(db_path: str) -> None:
         )
         con.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_raw_event_snapshot
+            ON train_predictions_raw(event_id, snapshot_ts_utc, id)
+            """
+        )
+        con.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_event_line
             ON train_stop_events(line_id, expected_arrival_utc)
             """
@@ -226,6 +232,31 @@ def fetch_line_stop_ids(line_id: str, app_id: Optional[str], app_key: Optional[s
     return stop_ids
 
 
+def evenly_sample_stops(stops: List[str], sample_size: int) -> List[str]:
+    if sample_size <= 0 or sample_size >= len(stops):
+        return stops
+    if sample_size == 1:
+        return [stops[len(stops) // 2]]
+
+    picked: List[str] = []
+    last_idx = len(stops) - 1
+    for i in range(sample_size):
+        idx = round(i * last_idx / (sample_size - 1))
+        picked.append(stops[idx])
+    return picked
+
+
+def rotating_sample_stops(stops: List[str], sample_size: int, cycle_index: int) -> List[str]:
+    if sample_size <= 0 or sample_size >= len(stops):
+        return stops
+    if not stops:
+        return stops
+
+    offset = cycle_index % len(stops)
+    rotated = stops[offset:] + stops[:offset]
+    return evenly_sample_stops(rotated, sample_size)
+
+
 def fetch_stop_arrivals(stop_id: str, app_id: Optional[str], app_key: Optional[str]) -> List[dict]:
     url = build_url(f"/StopPoint/{stop_id}/Arrivals", app_id, app_key)
     payload = http_get_json(url)
@@ -285,6 +316,7 @@ def collect_once(
     mode: str,
     line_ids: List[str],
     max_stops_per_line: int,
+    cycle_index: int,
     app_id: Optional[str],
     app_key: Optional[str],
 ) -> None:
@@ -301,7 +333,7 @@ def collect_once(
         except Exception:
             continue
         if max_stops_per_line > 0:
-            stops = stops[:max_stops_per_line]
+            stops = rotating_sample_stops(stops, max_stops_per_line, cycle_index)
         target_stops.update(stops)
 
     con = sqlite3.connect(db_path, timeout=20)
@@ -412,6 +444,7 @@ def run_collect_loop(
             mode=mode,
             line_ids=line_ids,
             max_stops_per_line=max_stops_per_line,
+            cycle_index=i,
             app_id=app_id,
             app_key=app_key,
         )
@@ -746,6 +779,7 @@ def run_monitor_loop(
                 mode=mode,
                 line_ids=line_ids,
                 max_stops_per_line=max_stops_per_line,
+                cycle_index=i,
                 app_id=app_id,
                 app_key=app_key,
             )
