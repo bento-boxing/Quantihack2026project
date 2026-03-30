@@ -523,9 +523,9 @@ def apply_boundary_friction(current_elo: float, raw_delta: float) -> float:
 
 
 def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) -> float:
-    w_arr = float(row["weighted_arrivals"])
-    w_late = float(row["weighted_lates"])
-    w_can = float(row["weighted_cancellations"])
+    w_arr = float(row.get("weighted_arrivals", 0.0))
+    w_late = float(row.get("weighted_lates", 0.0))
+    w_can = float(row.get("weighted_cancellations", 0.0))
     resolved_w = w_arr + w_late + w_can
     if resolved_w <= 0.0:
         return base_elo
@@ -534,11 +534,11 @@ def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) 
     late_ratio = w_late / resolved_w
     cancel_ratio = w_can / resolved_w
 
-    late_avg_minutes = float(row["late_minutes_total"]) / max(1.0, float(row["late_events"]))
+    late_avg_minutes = float(row.get("late_minutes_total", 0.0)) / max(1.0, float(row.get("late_events", 0)))
     late_saturation = 1.0 - math.exp(-max(0.0, late_avg_minutes) / 5.0)
 
-    peak_w = float(row["weighted_peak_events"])
-    peak_fail_w = float(row["weighted_peak_failures"])
+    peak_w = float(row.get("weighted_peak_events", 0.0))
+    peak_fail_w = float(row.get("weighted_peak_failures", 0.0))
     peak_fail_ratio = peak_fail_w / max(1.0, peak_w)
 
     peak_presence = min(1.0, peak_w / 45.0)
@@ -546,16 +546,27 @@ def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) 
     late_penalty = 0.40 * late_ratio * (0.35 + 0.65 * late_saturation)
     cancel_ratio_penalty = 3.10 * cancel_ratio
     peak_penalty = 0.42 * peak_fail_ratio * peak_presence
-    cancel_shock = 0.44 * (1.0 - math.exp(-float(row["missed_events"]) / 6.0))
-    late_shock = 0.04 * (1.0 - math.exp(-float(row["late_events"]) / 30.0))
-    late_count_pressure = 0.013 * math.log1p(float(row["late_events"]))
-    cancel_count_pressure = 0.060 * math.log1p(float(row["missed_events"]))
+    cancel_shock = 0.44 * (1.0 - math.exp(-float(row.get("missed_events", 0)) / 6.0))
+    late_shock = 0.04 * (1.0 - math.exp(-float(row.get("late_events", 0)) / 30.0))
+    late_count_pressure = 0.013 * math.log1p(float(row.get("late_events", 0)))
+    cancel_count_pressure = 0.060 * math.log1p(float(row.get("missed_events", 0)))
     on_time_reward = 0.30 * on_time_ratio
+
+    resolved_events = max(1.0, float(row.get("resolved_events", 0)))
+    streak_exposure = max(1.0, math.sqrt(resolved_events))
+    win_streak_ratio = float(row.get("win_streak_momentum", 0.0)) / streak_exposure
+    loss_streak_ratio = float(row.get("loss_streak_momentum", 0.0)) / streak_exposure
+    max_loss_streak = int(row.get("max_loss_streak", 0) or 0)
+
+    win_streak_bonus = 0.20 * math.tanh(1.6 * win_streak_ratio)
+    loss_streak_penalty = 0.55 * math.tanh(1.0 * loss_streak_ratio)
+    outage_penalty = 0.22 * math.tanh(0.30 * float(max_loss_streak)) * math.tanh(1.4 * cancel_ratio)
 
     performance = (
         on_time_ratio
         + on_time_reward
         + 0.28
+        + win_streak_bonus
         - late_penalty
         - cancel_ratio_penalty
         - peak_penalty
@@ -563,6 +574,8 @@ def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) 
         - late_shock
         - late_count_pressure
         - cancel_count_pressure
+        - loss_streak_penalty
+        - outage_penalty
     )
     qty_bonus = 0.002 * math.log1p(resolved_w)
     raw_delta = 820.0 * ((performance - 0.56) + qty_bonus)
@@ -863,6 +876,13 @@ def export_line_event_elo(
             "weighted_cancellations": 0.0,
             "weighted_peak_events": 0.0,
             "weighted_peak_failures": 0.0,
+            "resolved_events": 0,
+            "win_streak_momentum": 0.0,
+            "loss_streak_momentum": 0.0,
+            "max_win_streak": 0,
+            "max_loss_streak": 0,
+            "_win_streak_run": 0,
+            "_loss_streak_run": 0,
         }
 
     for r in rows:
@@ -886,6 +906,13 @@ def export_line_event_elo(
                 "weighted_cancellations": 0.0,
                 "weighted_peak_events": 0.0,
                 "weighted_peak_failures": 0.0,
+                "resolved_events": 0,
+                "win_streak_momentum": 0.0,
+                "loss_streak_momentum": 0.0,
+                "max_win_streak": 0,
+                "max_loss_streak": 0,
+                "_win_streak_run": 0,
+                "_loss_streak_run": 0,
             },
         )
         scores[line_id]["events"] = int(scores[line_id]["events"]) + 1
@@ -924,15 +951,42 @@ def export_line_event_elo(
         if arrived and not is_late:
             scores[line_id]["arrived_events"] = int(scores[line_id]["arrived_events"]) + 1
             scores[line_id]["weighted_arrivals"] = float(scores[line_id]["weighted_arrivals"]) + event_weight
+            scores[line_id]["resolved_events"] = int(scores[line_id]["resolved_events"]) + 1
+            win_run = int(scores[line_id]["_win_streak_run"]) + 1
+            scores[line_id]["_win_streak_run"] = win_run
+            scores[line_id]["_loss_streak_run"] = 0
+            scores[line_id]["max_win_streak"] = max(int(scores[line_id]["max_win_streak"]), win_run)
+            if win_run >= 2:
+                scores[line_id]["win_streak_momentum"] = float(scores[line_id]["win_streak_momentum"]) + (
+                    event_weight * 0.20 * ((win_run - 1) ** 1.05)
+                )
         elif arrived and is_late:
             scores[line_id]["late_events"] = int(scores[line_id]["late_events"]) + 1
             scores[line_id]["late_minutes_total"] = float(scores[line_id]["late_minutes_total"]) + (late_seconds / 60.0)
             scores[line_id]["weighted_lates"] = float(scores[line_id]["weighted_lates"]) + event_weight
+            scores[line_id]["resolved_events"] = int(scores[line_id]["resolved_events"]) + 1
+            loss_run = int(scores[line_id]["_loss_streak_run"]) + 1
+            scores[line_id]["_loss_streak_run"] = loss_run
+            scores[line_id]["_win_streak_run"] = 0
+            scores[line_id]["max_loss_streak"] = max(int(scores[line_id]["max_loss_streak"]), loss_run)
+            if loss_run >= 2:
+                scores[line_id]["loss_streak_momentum"] = float(scores[line_id]["loss_streak_momentum"]) + (
+                    event_weight * 0.32 * ((loss_run - 1) ** 1.15)
+                )
             if peak:
                 scores[line_id]["weighted_peak_failures"] = float(scores[line_id]["weighted_peak_failures"]) + (0.8 * event_weight)
         elif overdue and int(r["sightings"] or 0) >= CANCELLATION_MIN_SIGHTINGS:
             scores[line_id]["missed_events"] = int(scores[line_id]["missed_events"]) + 1
             scores[line_id]["weighted_cancellations"] = float(scores[line_id]["weighted_cancellations"]) + event_weight
+            scores[line_id]["resolved_events"] = int(scores[line_id]["resolved_events"]) + 1
+            loss_run = int(scores[line_id]["_loss_streak_run"]) + 1
+            scores[line_id]["_loss_streak_run"] = loss_run
+            scores[line_id]["_win_streak_run"] = 0
+            scores[line_id]["max_loss_streak"] = max(int(scores[line_id]["max_loss_streak"]), loss_run)
+            if loss_run >= 2:
+                scores[line_id]["loss_streak_momentum"] = float(scores[line_id]["loss_streak_momentum"]) + (
+                    event_weight * 0.32 * 1.45 * ((loss_run - 1) ** 1.15)
+                )
             if peak:
                 scores[line_id]["weighted_peak_failures"] = float(scores[line_id]["weighted_peak_failures"]) + (1.3 * event_weight)
         else:

@@ -331,6 +331,13 @@ def compute_leaderboard(
             "weighted_cancellations": 0.0,
             "weighted_peak_events": 0.0,
             "weighted_peak_failures": 0.0,
+            "resolved_events": 0,
+            "win_streak_momentum": 0.0,
+            "loss_streak_momentum": 0.0,
+            "max_win_streak": 0,
+            "max_loss_streak": 0,
+            "_win_streak_run": 0,
+            "_loss_streak_run": 0,
         }
 
     for r in events:
@@ -353,6 +360,13 @@ def compute_leaderboard(
                 "weighted_cancellations": 0.0,
                 "weighted_peak_events": 0.0,
                 "weighted_peak_failures": 0.0,
+                "resolved_events": 0,
+                "win_streak_momentum": 0.0,
+                "loss_streak_momentum": 0.0,
+                "max_win_streak": 0,
+                "max_loss_streak": 0,
+                "_win_streak_run": 0,
+                "_loss_streak_run": 0,
             }
 
         scores[line_id]["events"] = int(scores[line_id]["events"]) + 1
@@ -391,15 +405,42 @@ def compute_leaderboard(
         if arrived and not is_late:
             scores[line_id]["arrived_events"] = int(scores[line_id]["arrived_events"]) + 1
             scores[line_id]["weighted_arrivals"] = float(scores[line_id]["weighted_arrivals"]) + event_weight
+            scores[line_id]["resolved_events"] = int(scores[line_id]["resolved_events"]) + 1
+            win_run = int(scores[line_id]["_win_streak_run"]) + 1
+            scores[line_id]["_win_streak_run"] = win_run
+            scores[line_id]["_loss_streak_run"] = 0
+            scores[line_id]["max_win_streak"] = max(int(scores[line_id]["max_win_streak"]), win_run)
+            if win_run >= 2:
+                scores[line_id]["win_streak_momentum"] = float(scores[line_id]["win_streak_momentum"]) + (
+                    event_weight * 0.20 * ((win_run - 1) ** 1.05)
+                )
         elif arrived and is_late:
             scores[line_id]["late_events"] = int(scores[line_id]["late_events"]) + 1
             scores[line_id]["late_minutes_total"] = float(scores[line_id]["late_minutes_total"]) + (late_seconds / 60.0)
             scores[line_id]["weighted_lates"] = float(scores[line_id]["weighted_lates"]) + event_weight
+            scores[line_id]["resolved_events"] = int(scores[line_id]["resolved_events"]) + 1
+            loss_run = int(scores[line_id]["_loss_streak_run"]) + 1
+            scores[line_id]["_loss_streak_run"] = loss_run
+            scores[line_id]["_win_streak_run"] = 0
+            scores[line_id]["max_loss_streak"] = max(int(scores[line_id]["max_loss_streak"]), loss_run)
+            if loss_run >= 2:
+                scores[line_id]["loss_streak_momentum"] = float(scores[line_id]["loss_streak_momentum"]) + (
+                    event_weight * 0.32 * ((loss_run - 1) ** 1.15)
+                )
             if peak:
                 scores[line_id]["weighted_peak_failures"] = float(scores[line_id]["weighted_peak_failures"]) + (0.8 * event_weight)
         elif overdue and int(r["sightings"] or 0) >= CANCELLATION_MIN_SIGHTINGS:
             scores[line_id]["missed_events"] = int(scores[line_id]["missed_events"]) + 1
             scores[line_id]["weighted_cancellations"] = float(scores[line_id]["weighted_cancellations"]) + event_weight
+            scores[line_id]["resolved_events"] = int(scores[line_id]["resolved_events"]) + 1
+            loss_run = int(scores[line_id]["_loss_streak_run"]) + 1
+            scores[line_id]["_loss_streak_run"] = loss_run
+            scores[line_id]["_win_streak_run"] = 0
+            scores[line_id]["max_loss_streak"] = max(int(scores[line_id]["max_loss_streak"]), loss_run)
+            if loss_run >= 2:
+                scores[line_id]["loss_streak_momentum"] = float(scores[line_id]["loss_streak_momentum"]) + (
+                    event_weight * 0.32 * 1.45 * ((loss_run - 1) ** 1.15)
+                )
             if peak:
                 scores[line_id]["weighted_peak_failures"] = float(scores[line_id]["weighted_peak_failures"]) + (1.3 * event_weight)
         else:
@@ -470,9 +511,9 @@ def is_peak_london_time(expected_arrival_utc: str) -> bool:
 
 
 def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) -> float:
-    w_arr = float(row["weighted_arrivals"])
-    w_late = float(row["weighted_lates"])
-    w_can = float(row["weighted_cancellations"])
+    w_arr = float(row.get("weighted_arrivals", 0.0))
+    w_late = float(row.get("weighted_lates", 0.0))
+    w_can = float(row.get("weighted_cancellations", 0.0))
     resolved_w = w_arr + w_late + w_can
     if resolved_w <= 0.0:
         return base_elo
@@ -481,11 +522,11 @@ def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) 
     late_ratio = w_late / resolved_w
     cancel_ratio = w_can / resolved_w
 
-    late_avg_minutes = float(row["late_minutes_total"]) / max(1.0, float(row["late_events"]))
+    late_avg_minutes = float(row.get("late_minutes_total", 0.0)) / max(1.0, float(row.get("late_events", 0)))
     late_saturation = 1.0 - math.exp(-max(0.0, late_avg_minutes) / 5.0)
 
-    peak_w = float(row["weighted_peak_events"])
-    peak_fail_w = float(row["weighted_peak_failures"])
+    peak_w = float(row.get("weighted_peak_events", 0.0))
+    peak_fail_w = float(row.get("weighted_peak_failures", 0.0))
     peak_fail_ratio = peak_fail_w / max(1.0, peak_w)
 
     peak_presence = min(1.0, peak_w / 45.0)
@@ -493,16 +534,27 @@ def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) 
     late_penalty = 0.40 * late_ratio * (0.35 + 0.65 * late_saturation)
     cancel_ratio_penalty = 3.10 * cancel_ratio
     peak_penalty = 0.42 * peak_fail_ratio * peak_presence
-    cancel_shock = 0.44 * (1.0 - math.exp(-float(row["missed_events"]) / 6.0))
-    late_shock = 0.04 * (1.0 - math.exp(-float(row["late_events"]) / 30.0))
-    late_count_pressure = 0.013 * math.log1p(float(row["late_events"]))
-    cancel_count_pressure = 0.060 * math.log1p(float(row["missed_events"]))
+    cancel_shock = 0.44 * (1.0 - math.exp(-float(row.get("missed_events", 0)) / 6.0))
+    late_shock = 0.04 * (1.0 - math.exp(-float(row.get("late_events", 0)) / 30.0))
+    late_count_pressure = 0.013 * math.log1p(float(row.get("late_events", 0)))
+    cancel_count_pressure = 0.060 * math.log1p(float(row.get("missed_events", 0)))
     on_time_reward = 0.30 * on_time_ratio
+
+    resolved_events = max(1.0, float(row.get("resolved_events", 0)))
+    streak_exposure = max(1.0, math.sqrt(resolved_events))
+    win_streak_ratio = float(row.get("win_streak_momentum", 0.0)) / streak_exposure
+    loss_streak_ratio = float(row.get("loss_streak_momentum", 0.0)) / streak_exposure
+    max_loss_streak = int(row.get("max_loss_streak", 0) or 0)
+
+    win_streak_bonus = 0.20 * math.tanh(1.6 * win_streak_ratio)
+    loss_streak_penalty = 0.55 * math.tanh(1.0 * loss_streak_ratio)
+    outage_penalty = 0.22 * math.tanh(0.30 * float(max_loss_streak)) * math.tanh(1.4 * cancel_ratio)
 
     performance = (
         on_time_ratio
         + on_time_reward
         + 0.28
+        + win_streak_bonus
         - late_penalty
         - cancel_ratio_penalty
         - peak_penalty
@@ -510,6 +562,8 @@ def compute_line_elo_update(base_elo: float, row: Dict[str, float | int | str]) 
         - late_shock
         - late_count_pressure
         - cancel_count_pressure
+        - loss_streak_penalty
+        - outage_penalty
     )
     qty_bonus = 0.002 * math.log1p(resolved_w)
     raw_delta = 820.0 * ((performance - 0.56) + qty_bonus)
@@ -772,6 +826,43 @@ def fetch_detailed_event_rows_for_lines(
         con.close()
 
 
+def fetch_effect_rows_for_lines(db_path: str, mode: str, line_ids: List[str], lookback_hours: int) -> List[sqlite3.Row]:
+    if not line_ids:
+        return []
+
+    con = sqlite3.connect(db_path, timeout=1)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA busy_timeout=800")
+        placeholders = ",".join(["?"] * len(line_ids))
+        params: List[object] = [mode]
+        params.extend(line_ids)
+
+        sql = (
+            "SELECT "
+            "event_id, line_id, line_name, expected_arrival_utc, last_seen_utc, min_time_to_station, sightings "
+            "FROM train_stop_events "
+            "WHERE mode_name = ? "
+            f"AND line_id IN ({placeholders}) "
+            "AND expected_arrival_utc IS NOT NULL "
+        )
+
+        if lookback_hours > 0:
+            cutoff = datetime.now(timezone.utc).timestamp() - (lookback_hours * 3600)
+            cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+            sql += "AND expected_arrival_utc >= ? "
+            params.append(cutoff_iso)
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        sql += "AND expected_arrival_utc <= ? "
+        params.append(now_iso)
+
+        sql += "ORDER BY expected_arrival_utc ASC, event_id ASC"
+        return con.execute(sql, params).fetchall()
+    finally:
+        con.close()
+
+
 def fetch_seed_map(db_path: str) -> Dict[str, float]:
     con = sqlite3.connect(db_path, timeout=1)
     con.row_factory = sqlite3.Row
@@ -826,8 +917,11 @@ def classify_event_for_feed(row: sqlite3.Row, now_ts: float, grace_seconds: int,
 
     min_tts = row["min_time_to_station"]
     arrived_signal = (min_tts is not None) and (int(min_tts) <= ARRIVAL_DETECTED_SECONDS)
+    row_keys = row.keys()
+    current_location = str((row["current_location"] if "current_location" in row_keys else "") or "").strip().lower()
+    between_location = current_location.startswith("between ")
 
-    if arrived_signal and row["last_seen_utc"] is not None and now_ts >= exp_ts:
+    if arrived_signal and (not between_location) and row["last_seen_utc"] is not None and now_ts >= exp_ts:
         try:
             last_seen_ts = datetime.fromisoformat(str(row["last_seen_utc"]).replace("Z", "+00:00")).timestamp()
             if last_seen_ts > (exp_ts + late_grace_seconds):
@@ -859,6 +953,120 @@ def resolve_station_for_event(row: sqlite3.Row) -> str:
     if raw_station:
         return raw_station
     return str(row["station_name"] or "-")
+
+
+def _blank_effect_state(line_id: str, line_name: str) -> Dict[str, float | int | str]:
+    return {
+        "line_id": line_id,
+        "line_name": line_name,
+        "weighted_arrivals": 0.0,
+        "weighted_lates": 0.0,
+        "weighted_cancellations": 0.0,
+        "weighted_peak_events": 0.0,
+        "weighted_peak_failures": 0.0,
+        "late_events": 0,
+        "late_minutes_total": 0.0,
+        "missed_events": 0,
+    }
+
+
+def _event_effect_component(row: sqlite3.Row, event_type: str, late_grace_seconds: int) -> Dict[str, float | int]:
+    expected = str(row["expected_arrival_utc"] or "")
+    peak = is_peak_london_time(expected)
+    event_weight = 1.75 if peak else 1.0
+
+    comp: Dict[str, float | int] = {
+        "weighted_arrivals": 0.0,
+        "weighted_lates": 0.0,
+        "weighted_cancellations": 0.0,
+        "weighted_peak_events": event_weight if peak else 0.0,
+        "weighted_peak_failures": 0.0,
+        "late_events": 0,
+        "late_minutes_total": 0.0,
+        "missed_events": 0,
+    }
+
+    if event_type == "ontime":
+        comp["weighted_arrivals"] = event_weight
+    elif event_type == "late":
+        comp["weighted_lates"] = event_weight
+        comp["late_events"] = 1
+        if expected and row["last_seen_utc"]:
+            try:
+                exp_ts = datetime.fromisoformat(expected.replace("Z", "+00:00")).timestamp()
+                last_seen_ts = datetime.fromisoformat(str(row["last_seen_utc"]).replace("Z", "+00:00")).timestamp()
+                late_seconds = max(0.0, last_seen_ts - (exp_ts + late_grace_seconds))
+                comp["late_minutes_total"] = late_seconds / 60.0
+            except Exception:
+                comp["late_minutes_total"] = 0.0
+        if peak:
+            comp["weighted_peak_failures"] = 0.8 * event_weight
+    elif event_type == "cancelled":
+        comp["weighted_cancellations"] = event_weight
+        comp["missed_events"] = 1
+        if peak:
+            comp["weighted_peak_failures"] = 1.3 * event_weight
+
+    return comp
+
+
+def compute_event_effects(rows: List[sqlite3.Row], seed_map: Dict[str, float], now_ts: float, grace_seconds: int, late_grace_seconds: int) -> Dict[str, float]:
+    per_line: Dict[str, Dict[str, float | int | str]] = {}
+    comp_by_key: Dict[str, Dict[str, float | int]] = {}
+
+    for row in rows:
+        line_id = str(row["line_id"] or "")
+        line_name = str(row["line_name"] or line_id)
+        state = per_line.setdefault(line_id, _blank_effect_state(line_id, line_name))
+
+        event_type = classify_event_for_feed(row, now_ts=now_ts, grace_seconds=grace_seconds, late_grace_seconds=late_grace_seconds)
+        event_key = f"{str(row['event_id'])}|{event_type}"
+        comp = _event_effect_component(row, event_type=event_type, late_grace_seconds=late_grace_seconds)
+        comp_by_key[event_key] = comp
+
+        state["weighted_arrivals"] = float(state["weighted_arrivals"]) + float(comp["weighted_arrivals"])
+        state["weighted_lates"] = float(state["weighted_lates"]) + float(comp["weighted_lates"])
+        state["weighted_cancellations"] = float(state["weighted_cancellations"]) + float(comp["weighted_cancellations"])
+        state["weighted_peak_events"] = float(state["weighted_peak_events"]) + float(comp["weighted_peak_events"])
+        state["weighted_peak_failures"] = float(state["weighted_peak_failures"]) + float(comp["weighted_peak_failures"])
+        state["late_events"] = int(state["late_events"]) + int(comp["late_events"])
+        state["late_minutes_total"] = float(state["late_minutes_total"]) + float(comp["late_minutes_total"])
+        state["missed_events"] = int(state["missed_events"]) + int(comp["missed_events"])
+
+    full_elo_by_line: Dict[str, float] = {}
+    for line_id, state in per_line.items():
+        seed_elo = float(seed_map.get(line_id, BASE_ELO))
+        base_elo = adaptive_base_elo(seed_elo, state)
+        full_elo_by_line[line_id] = float(compute_line_elo_update(base_elo, state))
+
+    effect_by_key: Dict[str, float] = {}
+    for row in rows:
+        line_id = str(row["line_id"] or "")
+        event_type = classify_event_for_feed(row, now_ts=now_ts, grace_seconds=grace_seconds, late_grace_seconds=late_grace_seconds)
+        event_key = f"{str(row['event_id'])}|{event_type}"
+        comp = comp_by_key.get(event_key)
+        state = per_line.get(line_id)
+        full_elo = full_elo_by_line.get(line_id)
+        if (comp is None) or (state is None) or (full_elo is None):
+            effect_by_key[event_key] = 0.0
+            continue
+
+        reduced = dict(state)
+        reduced["weighted_arrivals"] = max(0.0, float(reduced["weighted_arrivals"]) - float(comp["weighted_arrivals"]))
+        reduced["weighted_lates"] = max(0.0, float(reduced["weighted_lates"]) - float(comp["weighted_lates"]))
+        reduced["weighted_cancellations"] = max(0.0, float(reduced["weighted_cancellations"]) - float(comp["weighted_cancellations"]))
+        reduced["weighted_peak_events"] = max(0.0, float(reduced["weighted_peak_events"]) - float(comp["weighted_peak_events"]))
+        reduced["weighted_peak_failures"] = max(0.0, float(reduced["weighted_peak_failures"]) - float(comp["weighted_peak_failures"]))
+        reduced["late_events"] = max(0, int(reduced["late_events"]) - int(comp["late_events"]))
+        reduced["late_minutes_total"] = max(0.0, float(reduced["late_minutes_total"]) - float(comp["late_minutes_total"]))
+        reduced["missed_events"] = max(0, int(reduced["missed_events"]) - int(comp["missed_events"]))
+
+        seed_elo = float(seed_map.get(line_id, BASE_ELO))
+        reduced_base = adaptive_base_elo(seed_elo, reduced)
+        elo_without = float(compute_line_elo_update(reduced_base, reduced))
+        effect_by_key[event_key] = full_elo - elo_without
+
+    return effect_by_key
 
 
 def render_line_chart_page(db_path: str, mode: str, grace_seconds: int, late_grace_seconds: int) -> None:
@@ -1110,6 +1318,12 @@ def render_events_page(db_path: str, mode: str, grace_seconds: int, late_grace_s
         lookback_hours=hours,
         limit_rows=limit_rows,
     )
+    effect_rows = fetch_effect_rows_for_lines(
+        db_path=db_path,
+        mode=mode,
+        line_ids=selected_lines,
+        lookback_hours=hours,
+    )
     if not rows:
         st.info("No events found for selected lines/time window.")
         return
@@ -1121,6 +1335,15 @@ def render_events_page(db_path: str, mode: str, grace_seconds: int, late_grace_s
         pass
 
     now_ts = datetime.now(timezone.utc).timestamp()
+    seed_map = fetch_seed_map(db_path)
+    event_effect_by_key = compute_event_effects(
+        rows=effect_rows,
+        seed_map=seed_map,
+        now_ts=now_ts,
+        grace_seconds=grace_seconds,
+        late_grace_seconds=late_grace_seconds,
+    )
+
     table_rows: List[str] = []
     event_labels_by_key: Dict[str, str] = {}
     current_event_keys: set[str] = set()
@@ -1134,29 +1357,11 @@ def render_events_page(db_path: str, mode: str, grace_seconds: int, late_grace_s
         station = resolve_station_for_event(r)
         platform = str(r["platform_name"] or "-")
         destination = str(r["destination_name"] or "-")
-        sightings = int(r["sightings"] or 0)
-
         try:
             exp_local = datetime.fromisoformat(str(r["expected_arrival_utc"]).replace("Z", "+00:00")).astimezone(LONDON_TZ)
             exp_txt = exp_local.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             exp_txt = str(r["expected_arrival_utc"] or "-")
-
-        seen_txt = "-"
-        if r["last_seen_utc"]:
-            try:
-                seen_local = datetime.fromisoformat(str(r["last_seen_utc"]).replace("Z", "+00:00")).astimezone(LONDON_TZ)
-                seen_txt = seen_local.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                seen_txt = str(r["last_seen_utc"])
-
-        activity_txt = "-"
-        if r["activity_utc"]:
-            try:
-                activity_local = datetime.fromisoformat(str(r["activity_utc"]).replace("Z", "+00:00")).astimezone(LONDON_TZ)
-                activity_txt = activity_local.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                activity_txt = str(r["activity_utc"])
 
         status_info = live_status.get(line_id, {"desc": "Unknown", "color": "#9ca3af"})
         status_desc = str(status_info.get("desc") or "Unknown")
@@ -1181,8 +1386,13 @@ def render_events_page(db_path: str, mode: str, grace_seconds: int, late_grace_s
             continue
 
         event_key = f"{str(r['event_id'])}|{event_label}"
+        effect_key = f"{str(r['event_id'])}|{event_type}"
         current_event_keys.add(event_key)
         event_labels_by_key[event_key] = event_label
+
+        elo_effect = float(event_effect_by_key.get(effect_key, 0.0))
+        elo_effect_label = f"{elo_effect:+.2f}"
+        elo_effect_color = "#22c55e" if elo_effect >= 0.0 else "#ef4444"
 
         line_colors = LINE_BOX_COLORS.get(line_id, {"bg": "#1f2937", "fg": "#ffffff"})
         line_chip = (
@@ -1200,9 +1410,7 @@ def render_events_page(db_path: str, mode: str, grace_seconds: int, late_grace_s
             f"<td style='padding:8px 10px;'>{escape(destination)}</td>"
             f"<td style='padding:8px 10px; font-weight:700;'>{escape(event_label)}</td>"
             f"<td style='padding:8px 10px; white-space:nowrap;'><span style='color:{status_color};'>●</span> {escape(status_desc)}</td>"
-            f"<td style='padding:8px 10px; white-space:nowrap;'>{escape(activity_txt)}</td>"
-            f"<td style='padding:8px 10px; white-space:nowrap;'>{escape(seen_txt)}</td>"
-            f"<td style='padding:8px 10px; text-align:right;'>{sightings}</td>"
+            f"<td style='padding:8px 10px; white-space:nowrap; color:{elo_effect_color}; font-weight:700;'>{escape(elo_effect_label)}</td>"
             "</tr>"
         )
 
@@ -1238,7 +1446,7 @@ def render_events_page(db_path: str, mode: str, grace_seconds: int, late_grace_s
 
     table_html = [
         "<div style='max-height:560px; overflow-y:auto; border:1px solid #1f2937; border-radius:10px;'>",
-        "<table style='width:100%; border-collapse:collapse; min-width:1250px;'>",
+        "<table style='width:100%; border-collapse:collapse; min-width:1020px;'>",
         "<thead style='position:sticky; top:0; background:#0b1220; z-index:2;'>",
         "<tr>",
         "<th style='text-align:left; padding:8px 10px;'>expected ETA (BST)</th>",
@@ -1248,9 +1456,7 @@ def render_events_page(db_path: str, mode: str, grace_seconds: int, late_grace_s
         "<th style='text-align:left; padding:8px 10px;'>destination</th>",
         "<th style='text-align:left; padding:8px 10px;'>event</th>",
         "<th style='text-align:left; padding:8px 10px;'>current line status</th>",
-        "<th style='text-align:left; padding:8px 10px;'>activity (BST)</th>",
-        "<th style='text-align:left; padding:8px 10px;'>last seen (BST)</th>",
-        "<th style='text-align:right; padding:8px 10px;'>sightings</th>",
+        "<th style='text-align:left; padding:8px 10px;'>effect on elo</th>",
         "</tr></thead><tbody>",
     ]
     table_html.extend(table_rows)
