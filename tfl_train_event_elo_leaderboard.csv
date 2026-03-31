@@ -1,12 +1,12 @@
 line_id,lines,elo,on-time arrivals,late arrivals,cancelled trains
-jubilee,Jubilee,2415,1507,6,0
-district,District,1939,1269,23,1
-circle,Circle,1750,200,4,2
-victoria,Victoria,1655,1808,4,9
-metropolitan,Metropolitan,1560,153,2,3
-central,Central,1504,969,13,6
-bakerloo,Bakerloo,1450,1153,0,26
-northern,Northern,1260,2081,38,8
-hammersmith-city,Hammersmith & City,1101,664,9,18
-waterloo-city,Waterloo & City,1069,37,9,0
-piccadilly,Piccadilly,693,1395,78,28
+bakerloo,Bakerloo,1714,111,8,3
+waterloo-city,Waterloo & City,1597,192,78,0
+jubilee,Jubilee,1334,934,62,19
+district,District,1249,1779,82,61
+victoria,Victoria,1222,1072,58,55
+northern,Northern,1179,964,81,52
+metropolitan,Metropolitan,1173,801,68,39
+central,Central,1148,708,63,43
+hammersmith-city,Hammersmith & City,990,709,69,70
+circle,Circle,898,600,53,80
+piccadilly,Piccadilly,859,934,56,147
