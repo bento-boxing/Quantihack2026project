@@ -2,6 +2,7 @@ import sqlite3
 import time
 import math
 import json
+from statistics import median
 from html import escape
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -628,10 +629,6 @@ def render_live_leaderboard(
         grace_seconds=grace_seconds,
         late_grace_seconds=late_grace_seconds,
     )
-    try:
-        persist_leaderboard_snapshot(db_path=db_path, leaderboard=leaderboard)
-    except Exception:
-        pass
 
     st.subheader("Elo leaderboard")
     display_rows = []
@@ -1095,7 +1092,7 @@ def render_line_chart_page(db_path: str, mode: str, grace_seconds: int, late_gra
         st.info("No Elo trajectory data available yet for selected lines/time window.")
         return
 
-    points = []
+    per_line_bucket: Dict[str, Dict[datetime, List[tuple[datetime, float]]]] = {}
     elo_vals: List[float] = []
     for r in rows:
         try:
@@ -1103,17 +1100,47 @@ def render_line_chart_page(db_path: str, mode: str, grace_seconds: int, late_gra
         except Exception:
             continue
         dt_local = dt_utc.astimezone(LONDON_TZ)
+        bucket = dt_local.replace(second=0, microsecond=0)
         elo = float(r["elo"])
-        elo_vals.append(elo)
-        points.append(
-            {
-                "time": dt_local.isoformat(),
-                "line": names.get(str(r["line_id"]), str(r["line_id"])),
-                "elo": round(elo, 2),
-            }
-        )
 
-    if not points:
+        line_label = names.get(str(r["line_id"]), str(r["line_id"]))
+        line_map = per_line_bucket.setdefault(line_label, {})
+        line_map.setdefault(bucket, []).append((dt_local, elo))
+
+    points = []
+    for line_label in sorted(per_line_bucket.keys()):
+        bucket_map = per_line_bucket[line_label]
+        prev_elo: Optional[float] = None
+        line_times: List[str] = []
+        raw_vals: List[float] = []
+        for bucket in sorted(bucket_map.keys()):
+            series = sorted(bucket_map[bucket], key=lambda x: x[0])
+            if not series:
+                continue
+            vals = [v for _, v in series]
+            if prev_elo is None:
+                elo = vals[0]
+            else:
+                prev = float(prev_elo)
+                elo = min(vals, key=lambda v: abs(v - prev))
+            prev_elo = elo
+            line_times.append(bucket.isoformat())
+            raw_vals.append(float(elo))
+
+        for i, t in enumerate(line_times):
+            left = max(0, i - 2)
+            right = min(len(raw_vals), i + 3)
+            smoothed = float(median(raw_vals[left:right]))
+            elo_vals.append(smoothed)
+            points.append(
+                {
+                    "time": t,
+                    "line": line_label,
+                    "elo": round(smoothed, 2),
+                }
+            )
+
+    if not points or not elo_vals:
         st.info("No Elo trajectory data available yet for selected lines/time window.")
         return
 
@@ -1126,7 +1153,7 @@ def render_line_chart_page(db_path: str, mode: str, grace_seconds: int, late_gra
     x_domain = [window_start.isoformat(), window_end.isoformat()]
 
     spec = {
-        "mark": {"type": "line", "point": True},
+        "mark": {"type": "line", "interpolate": "monotone", "point": False},
         "encoding": {
             "x": {
                 "field": "time",
